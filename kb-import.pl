@@ -9,26 +9,36 @@ my $dst=$ARGV[0];
 my $wd=$ARGV[1];
 use strict;
 my $debug=0;
+my $ignore_errors=1;
+my $defaultws="KBaseReferences";
 
 my $hs="kbhs";
 
 #
-#print "$oldws $newws\n";
 my $hdst = Bio::KBase::HandleService->new("http://".$dst."/services/handleservice");
 
 #
 my $dstws = get_ws_client("http://".$dst."/services/ws") or die "Unable to connect to $dst ws";
 
 my %handles;
+
+# Maps an old reference to a new reference.
+# The format is ##/##/##  ws/id/version.
 my %refmap;
+
 # old ws to new ws
 my %mapws;
 
 my %oldobj;
 my %ws2id;
 
+# oldids
+# List of all oldids and the file that has the data
+my %oldids;
+
 # list of referenced objects
 my %references;
+my %refs;
 
 # Exist in target
 my %exist;
@@ -36,42 +46,31 @@ my %exist;
 chdir $wd or die "Unable to cd";
 load_ckpt("./kbei.ckpt");
 
-
-## export/cache objects from WS
-#export_workspace($ews);
-
-## Build map of src objects
-#print "Scanning exported objects\n";
-#scan_objects();
-
-
-#open CP,"> ./kbei.ckpt" or die "Unable to open ckpt";
-#print CP to_json({'handles'=>\%handles,'references'=>\%references,'objects'=>\%oldobj},{pretty=>1});
-#close CP;
-#print "Scan for missing references\n";
-#get_references();
-
-#print "Download handle data\n";
-#get_handle_files();
+# Scan the downloaded referenced objects
+scan_ref_objects();
 
 # Build a list of workspaces
-my %wsl;
+my %ws_list;
 my $x=$dstws->list_workspace_info({});
-map {$wsl{$_->[1]}=$_->[0];} @{$x};
+# A bit cryptic.  list_workspace returns an array of array references
+# The 0th element is the id, the 1st element is the name
+map {$ws_list{$_->[1]}=$_->[0];} @{$x};
 
+# scan the exported objects and build up a map of old ids to names
 for my $o (keys %oldobj){
   $ws2id{$oldobj{$o}->{ws}}=$oldobj{$o}->{wsid};
+  $oldids{$o}=$oldobj{$o}->{file};
 }
 
 print "Scanning target workspaces for references\n";
+# Go through the list of workspaces and look for objects
+# that have already been uploaded.  Add that to the refmap
 for my $ws (sort keys %ws2id){
-  if (! defined $wsl{$ws}){
+  if (! defined $ws_list{$ws}){
     print "Create $ws\n";
     $dstws->create_workspace({'workspace'=>$ws}) || exit;
   }
-  my $newws=$wsl{$ws};
-  #$_=`ws-workspace $ws|tail -1` or die "workspace doesn't exist";
-  #my ($newws,$name,$owner)=split;
+  my $newws=$ws_list{$ws};
   print "$ws $newws\n";
   $mapws{$ws2id{$ws}}=$newws;
   my $x=$dstws->list_objects({'workspaces'=>[$ws]});
@@ -90,14 +89,21 @@ for my $ws (sort keys %ws2id){
     }
   }
   close W;
-
 }
 
 print "Loading stage\n";
 print "- Loading Handle data\n";
 for my $hid (keys %handles){
-#        $handles{$hid}->{new}=hs_upload($hdst,$handles{$hid});
-} 
+    try {
+      my $tmp=hs_upload($hdst,$handles{$hid});
+      $handles{$hid}->{new}=$tmp;
+    }
+    catch {
+      print STDERR "Upload of handle $hid failed\n";
+    };
+}
+
+# Upload refernces
 
 print "- Loading workspace object\n";
 my $loaded=0;
@@ -106,60 +112,102 @@ for my $object (sort keys %oldobj){
   next if defined $exist{$object};
   print "Load $object\n";
   my $wobj=$oldobj{$object};
-  # Read in data
   my $file=$oldobj{$object}->{file};
   my ($ws,$obj)=split /\//;
-  my $objdata;
-  my $json=read_file($file);
-  if ($wobj->{handleobj} == 1){
-    # Create a new object
-    print "Updating Handle Object $wobj->{name}\n";
-    $objdata=decode_json($json); 
-    #my $new=update_handle_object(decode_json($json));
-    my $new=update_handle_object($objdata->{data});
-    #print Dumper($new);
-    #open(TMP,"> tmp.out");
-    #print TMP to_json($new);
-    #close TMP;
-  }
-  else{
-    # could change this to just do references known to be in the object
-    for my $oldref (keys %refmap) {
-      my $newref=$refmap{$oldref};
-      $json=~s |$oldref[0-9]+|$newref|g;
-    }
-    $objdata=decode_json($json);
-    #open(TMP,"> tmp.out");
-    #print TMP $json;
-    #close TMP;
-  }
-  #`ws-workspace $wobj->{ws}` or die "Unable to choose ws";
-  #`ws-load $wobj->{type} $wobj->{name} tmp.out` or die "Failed to load";
-  my $saveobj={'type'=>$wobj->{type},'name'=>$wobj->{name},'data'=>$objdata->{data},'meta'=>$objdata->{metaa},'provenance'=>undef};
-  #open(O,">/tmp/d.out");
-  #print O Dumper($saveobj);
-  # close O;
-  my $p={'workspace'=>$wobj->{ws}, 'objects'=>[$saveobj]};
-  #next;
-  try {
-    print "Save $object\n" if $debug;
-    my $result=$dstws->save_objects($p);
-    $loaded++;
-  }
-  catch {
-     print "Failed to save $wobj->{name}\n$_\n";#$_;
-     #if ($wobj->{name}=~/rhodo/){
-     #  print Dumper($p);
-     #  open T, ">tmp";
-     #  print T to_json($p->{objects}[0]->{data},{ ascii => 1, pretty => 1 } );
-     #  exit;
-     #}
-  };
+  load_object($file);
 
 }
 print "Loaded $loaded new objects\n";
 
 exit;
+
+# Load the object
+sub load_object{
+  my $file=shift;
+
+  # Read in data
+  print " - Loading $file\n";
+  my $objdata;
+  my $json=read_file($file);
+  my $objdata=decode_json($json); 
+  my ($objid,$name,$type,$sdate,$ver,$saveby,$wsid,$workspace,$chsum,$size,$meta)=@{$objdata->{info}};
+  my $obj_byname="$workspace/$name";
+  my $obj_byid="$wsid/$objid/$ver";
+  my $wobj={'id'=>$objid,'file'=>$file,'name'=>$name,
+        'type'=>$type,'ws'=>$workspace,'wsid'=>$wsid,
+        'fname'=>$obj_byname, 'fid'=>$obj_byid};
+
+  if (defined $objdata->{'extracted_ids'}->{'handle'}){
+    # Create a new object
+    print "Updating Handle Object $wobj->{name}\n";
+    my $new=update_handle_object($objdata->{data});
+  }
+  else{
+    # could change this to just do references known to be in the object
+    $json=scan_references($json);
+    # Maybe we should decode the object again?
+    $objdata=decode_json($json); 
+  }
+  my $saveobj={'type'=>$wobj->{type},'name'=>$wobj->{name},'data'=>$objdata->{data},'meta'=>$objdata->{metaa},'provenance'=>undef};
+  if ( ! defined $ws_list{$workspace}){
+    print "Workspace $workspace doesn't exist.  Using default $defaultws\n";
+    $workspace=$defaultws;
+  }
+  my $p={'workspace'=>$workspace, 'objects'=>[$saveobj]};
+  try {
+    print "Save $workspace/$name\n" if $debug;
+    my $result=$dstws->save_objects($p);
+    $loaded++;
+    my ($objid,$name,$type,$sdate,$ver,$saveby,$wsid,$workspace,$chsum,$size,$meta)=@{$result->[0]};
+    # The new objected id
+    my $newobj_byid="$wsid/$objid/$ver";
+
+    # Record the mapping
+    $refmap{$obj_byid}=$newobj_byid;
+
+    open(F,'>'.$file.'~'.$dst) or die "Unable to open output file";
+    print F to_json($result->[0],{ ascii => 1, pretty => 1 } );
+    close F;
+  }
+  catch {
+     print "Failed to save $wobj->{name}\n";
+     print "   ".substr($_,1,2000)."...\n";
+     open T, ">tmp";
+     print T to_json($p->{objects}[0]->{data},{ ascii => 1, pretty => 1 } );
+     close T;
+     exit if $ignore_errors eq 0;
+     #if ($wobj->{name}=~/rhodo/){
+     #  print Dumper($p);
+       exit;
+     #}
+  };
+
+}
+
+# Search the object data for references
+#
+sub scan_references {
+  my $json=shift;
+
+  for my $oldref (keys %oldids){
+    if ($json=~/$oldref/ && ! defined $refmap{$oldref}){
+      print "Missing reference: $oldref.  Loading.\n";
+      load_object($oldids{$oldref});
+    }
+  }
+  for my $oldref (keys %refmap) {
+     my $newref=$refmap{$oldref};
+     if ($oldref=~/[0-9]$/){  # Versioned reference
+       #print "   D: Versioned substituting $oldref with $newref\n";
+       $json=~s |$oldref|$newref|g;
+     }
+     else { # Non-vesioned reference
+       #print "   D: Non-versioned substituting $oldref with $newref\n";
+       $json=~s |$oldref[0-9]+|$newref|g;
+     }
+  }
+  return $json;
+}
 
 sub load_ckpt {
   my $f=shift;
@@ -178,15 +226,26 @@ sub load_ckpt {
   }
 }
 
-# Scan files to get references and hash references
-sub scan_objects {
-  open(L,"find data -type f|");
+# Scan referenced objects and build up a map
+# Also keep track of any objects that have already been uploaded.
+sub scan_ref_objects {
+  open(L,"find refs -type f|");
   while(my $file=<L>){
     chomp $file;
-    my ($data,$obj_byid)=split /\//,$file;
-    print "id: $obj_byid file:$file\n";
-    process_object($file); # unless defined $references{$obj_byid};  
-    #print "$ws/$name $_\n";
+    my ($data,$workspace,$name,$wsid,$objid,$ver,$host)=split /[\/~]/,$file;
+    my $obj_byid="$wsid/$objid/$ver";
+    if (defined $host && $host eq $dst){
+      print " - Already uploaded $obj_byid to $dst\n";
+      my $json=read_file($file);
+      my $data=decode_json($json);
+      my ($objid,$name,$type,$sdate,$ver,$saveby,$wsid,$workspace,$chsum,$size,$meta)=@{$data};
+      my $new_byid="$wsid/$objid/$ver";
+      $refmap{$obj_byid}=$new_byid;
+    }
+    else{
+      my $obj_byid="$wsid/$objid/$ver";
+      $oldids{$obj_byid}=$file;
+    }
   }
   close L;
 }
@@ -295,31 +354,6 @@ sub walk_object {
  
 }
 
-#
-#sub get_handle_files {
-#   for my $hid (keys %handles){
-#     my $h=$handles{$hid};
-#     my $out=$hs."/".$h->{hid};
-#     #if (defined $files{$h->{file_name}}){
-#     #  print "Repeat\n";
-#     #  print Dumper($h);
-#     #  print Dumper($files{$h->{file_name}});
-#     #}
-#     #$files{$h->{file_name}}=$h;
-#     if (! -e $out){
-#       print "Downloading $out\n";
-#       my $rv  = $hsrc->download($h, $out);
-#     }
-#     my $out=$hs."/".$h->{hid}.".meta";
-#     if (! -e $out){
-#       print "Downloading $out\n";
-#       my $rv  = $hsrc->download_metadata($h, $out);
-#     }
-#     else{
-#       print "Skipping $hid $h->{file_name}\n";
-#     }
-#  }
-#}*/
 
 sub hs_upload {
   my $hdst=shift;
@@ -354,54 +388,6 @@ sub hs_upload {
 }
 
 
-#sub get_references {
-#  for my $obj (keys %references){
-#    my $file="./refs/".join "~",split /\//,$obj;
-#    if (-e $file){
-#        print "Skipping $obj..cached\n";
-#        next;
-#    }
-#    next if -e $file;
-#    if (! defined $oldobj{$obj}){
-##ObjectIdentity is a reference to a hash where the following keys are defined:
-##        workspace has a value which is a Workspace.ws_name
-##        wsid has a value which is a Workspace.ws_id
-##        name has a value which is a Workspace.obj_name
-##        objid has a value which is a Workspace.obj_id
-##        ver has a value which is a Workspace.obj_ver
-##        ref has a value which is a Workspace.obj_ref
-#       my ($wsid,$oid,$ver)=split /\//,$obj; 
-#       my $ref_chain=[{'wsid'=>$wsid,'objid'=>$oid,'ver'=>$ver}];
-#       my $robj=$obj;
-#       while (defined $references{$robj}){
-#         #print "Ref chain $obj refby:$references{$obj}\n";
-#         my ($wsid,$oid,$ver)=split /\//,$references{$obj};
-#         unshift @{$ref_chain},{'wsid'=>$wsid,'objid'=>$oid,'ver'=>$ver};
-#         $robj=$references{$robj};
-#       }
-#       try {
-#          my $objdata=$srcws->get_referenced_objects([$ref_chain]);
-#          serialize_object($objdata->[0],$file);
-#       }
-#       catch {
-#            #print Dumper($ref_chain);
-#            print "Unable to get $obj ".substr($_,0,60)."...\n";
-#       }
-#    }
-#  }
-#}
-
-sub serialize_object {
-  my $data=shift;
-  my $file=shift;
-
-  my ($oid,$name,$type,$save_data,$version,$saved_by,$wsid,$workspace,$chsum,$size,$meta)=@{$data->{info}};
-  print "reference: $oid, $name, $type, $workspace, $wsid\n";
-  open(O, "> $file") or die "Unable to open $file";
-  print O to_json($data,{ ascii => 1, pretty => 1 } );
-  close O;
-}
-
 #ObjectData is a reference to a hash where the following keys are defined:
 #        data has a value which is an UnspecifiedObject, which can hold any non-null object
 #        info has a value which is a Workspace.object_info
@@ -422,36 +408,3 @@ sub serialize_object {
 #        9: (size) an int
 #        10: (meta) a Workspace.usermeta
 #}
-
-
-#sub  export_workspace {
-#  my $ws=shift;
-#  my $x=$srcws->list_workspace_info({});
-#  my %srcwsl;
-#  map {$srcwsl{$_->[1]}=$_->[0];} @{$x};
-#  # List the export workspace
-#  my $x=$srcws->list_objects({'workspaces'=>[$ws]});
-#  for my $obj (@{$x}){
-#    my ($oid,$name,$type,$sdate,$ver,$saveby,$wsid,$workspace,$chsum,$size,$meta)=@{$obj};
-#    my $file="./data/".join "~",($wsid,$oid,$ver);
-#    print "$file\n";
-#    if (! -e $file){
-#      my $objref=[{'wsid'=>$wsid,'objid'=>$oid,'ver'=>$ver}];
-#      my $objdata=$srcws->get_objects($objref);
-#      serialize_object($objdata->[0],$file) unless -e $file;
-#    }
-#  }
-#}
-
-#  obj_id objid - the numerical id of the object.
-#                   obj_name name - the name of the object.
-#                   type_string type - the type of the object.
-#                   timestamp save_date - the save date of the object.
-#                   obj_ver ver - the version of the object.
-#                   username saved_by - the user that saved or copied the object.
-#                   ws_id wsid - the workspace containing the object.
-#                   ws_name workspace - the workspace containing the object.
-#                   string chsum - the md5 checksum of the object.
-#                   int size - the size of the object in bytes.
-#                   usermeta meta - arbitrary user-supplied metadata about
-#                           the object.
